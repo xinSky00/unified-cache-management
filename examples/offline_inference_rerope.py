@@ -110,8 +110,8 @@ def main():
         materials = []
         questions = []
         references = []
-        batch_size = 15
-        num_batch = 3
+        batch_size = 5
+        num_batch = 2
         for idx in range(num_batch):
             data = data_all[idx * batch_size: (idx+1) * batch_size]
 
