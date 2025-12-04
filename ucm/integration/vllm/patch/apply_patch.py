@@ -31,12 +31,14 @@ from typing import Optional
 
 from ucm.logger import init_logger
 
+
 logger = init_logger(__name__)
 
 import os
 
 PLATFORM = os.getenv("PLATFORM")
-
+use_rerope = os.getenv("VLLM_USE_REROPE", "false")
+use_rerope = bool(use_rerope)
 
 def _patch_ascend() -> bool:
     return PLATFORM == "ascend"
@@ -97,6 +99,8 @@ def apply_all_patches() -> None:
         # Apply version-specific patches
         if version == "0.9.1":
             _apply_patches_v091()
+        elif version == "0.9.2" and use_rerope:
+            _apply_patches_rerope()
         elif version == "0.9.2":
             _apply_patches_v092()
         else:
@@ -130,6 +134,13 @@ def _apply_patches_v092() -> None:
         from .patch_funcs.v092.vllm_ascend_adapt import _apply_ascend_patch
 
         _apply_ascend_patch()  # apply vllm-ascend-adapt.patch
+
+
+def _apply_patches_rerope() -> None:
+    """Apply patches for vLLM 0.9.2 for triton rerope"""
+    from .patch_funcs.v092.vllm_rerope_adapt import _apply_rerope_adapt_patches
+
+    _apply_rerope_adapt_patches()
 
 
 def install_import_hook() -> None:
