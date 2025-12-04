@@ -37,14 +37,13 @@ rerope_config = VllmPatchConfig()
 
 REROPE_WINDOW = rerope_config.rerope_window
 TRAINING_LENGTH = rerope_config.training_length
-# REROPE_WINDOW = 32768
-# TRAINING_LENGTH = 32768
 
 _UCM_UNIFIED_ATTENTION_WITH_OUTPUT_REGISTERED = False
 
 
 def _apply_rerope_adapt_patches() -> None:
     try:
+        _patch_validate_model_input()
         _patch_request_succeed_dumped_blocks()
         _patch_attention_spec()
         _patch_qwen_model()
@@ -55,6 +54,76 @@ def _apply_rerope_adapt_patches() -> None:
     except Exception as e:
         logger.error(f"Failed to apply aggre patch: {e}", exc_info=True)
         raise
+
+
+# ==================== vllm/v1/engine/processor.py ====================
+def _patch_validate_model_input() -> None:
+    """"Patch for the compare of input length with original model length"""
+    try:
+        from typing import Literal, Optional
+        from vllm.inputs import SingletonInputs
+        from vllm.lora.request import LoRARequest
+        from vllm.multimodal.processing import EncDecMultiModalProcessor
+        from vllm.v1.engine.processor import Processor
+
+        def _validate_model_input_and_compare(
+            self,
+            prompt_inputs: SingletonInputs,
+            lora_request: Optional[LoRARequest],
+            *,
+            prompt_type: Literal["encoder", "decoder"],
+        ):
+            model_config = self.model_config
+            tokenizer = self.tokenizer.get_lora_tokenizer(lora_request)
+
+            prompt_ids = prompt_inputs["prompt_token_ids"]
+            if not prompt_ids:
+                if prompt_type == "encoder" and model_config.is_multimodal_model:
+                    pass  # Mllama may have empty encoder inputs for text-only data
+                else:
+                    raise ValueError(f"The {prompt_type} prompt cannot be empty")
+
+            max_input_id = max(prompt_ids, default=0)
+            if max_input_id > tokenizer.max_token_id:
+                raise ValueError(f"Token id {max_input_id} is out of vocabulary")
+
+            max_prompt_len = self.model_config.max_model_len
+            if len(prompt_ids) > max_prompt_len:
+                if prompt_type == "encoder" and model_config.is_multimodal_model:
+                    mm_registry = self.input_preprocessor.mm_registry
+                    mm_processor = mm_registry.create_processor(
+                        model_config,
+                        tokenizer=tokenizer,
+                    )
+                    assert isinstance(mm_processor, EncDecMultiModalProcessor)
+
+                    if mm_processor.pad_dummy_encoder_prompt:
+                        return  # Skip encoder length check for Whisper
+
+                if model_config.is_multimodal_model:
+                    suggestion = (
+                        "Make sure that `max_model_len` is no smaller than the "
+                        "number of text tokens plus multimodal tokens. For image "
+                        "inputs, the number of image tokens depends on the number "
+                        "of images, and possibly their aspect ratios as well.")
+                else:
+                    suggestion = (
+                        "Make sure that `max_model_len` is no smaller than the "
+                        "number of text tokens.")
+
+                raise ValueError(
+                    f"The {prompt_type} prompt (length {len(prompt_ids)}) is "
+                    f"longer than the maximum model length of {max_prompt_len}. "
+                    f"{suggestion}")
+            
+            # compare the length of input tokens with model's pretraining length
+            rerope_config.use_rerope = len(prompt_ids) > REROPE_WINDOW
+        
+        Processor._validate_model_input = _validate_model_input_and_compare
+
+
+    except ImportError:
+        logger.warning("Could not patch Processor._validate_model_input_and_compare - module not found")
 
 
 # ==================== vllm/v1/request.py ====================
@@ -87,17 +156,21 @@ def _patch_attention_spec() -> None:
             Patched version of page_size_bytes property.
             Adds REROPE support with coefficient=3.
             """
-           
-            coef = 3
-            
+            # For MLA we only store a single latent vector
+            if self.use_mla:
+                coef = 1
+            elif rerope_config.use_rerope:
+                coef = 3
+            else:
+                coef = 2
             return coef * self.block_size * self.num_kv_heads * self.head_size \
-                * get_dtype_size(self.dtype)
+                    * get_dtype_size(self.dtype)
         
         AttentionSpec.page_size_bytes = property(_page_size_bytes_rerope)
 
     except ImportError:
         logger.warning(
-            "Could not patch unified attention with output - module not found"
+            "Could not patch AttentionSpec with _page_size_bytes_rerope - module not found"
         )
 
 
@@ -118,14 +191,19 @@ def _patch_qwen_model() -> None:
             qkv, _ = self.qkv_proj(hidden_states)
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-            q *= ((positions + 1)[:, None].log() / math.log(TRAINING_LENGTH)).clip(1).to(q.dtype)
-            q2 = q.clone()
-            k2 = k.clone()
-            k0 = k.clone()
+            if rerope_config.use_rerope:
+                q *= ((positions + 1)[:, None].log() / math.log(TRAINING_LENGTH)).clip(1).to(q.dtype)
+                q2 = q.clone()
+                k2 = k.clone()
+                k0 = k.clone()
 
-            q, k = self.rotary_emb(positions, q, k)
-            q2, _ = self.rotary_emb(positions * 0 + REROPE_WINDOW, q2, k2)
-            del k2
+                q, k = self.rotary_emb(positions, q, k)
+                q2, _ = self.rotary_emb(positions * 0 + REROPE_WINDOW, q2, k2)
+                del k2
+            else:
+                q, k = self.rotary_emb(positions, q, k)
+                q2 = None
+                k0 = None
             
             attn_output = self.attn(q, k, q2, k0, v)
             output, _ = self.o_proj(attn_output)
@@ -135,7 +213,7 @@ def _patch_qwen_model() -> None:
 
 
     except ImportError:
-        logger.warning("Could not patch llama modelr - module not found") 
+        logger.warning("Could not patch qwen2 modelr - module not found") 
 
 
 # ==================== vllm/attention/layer.py  ====================
@@ -156,8 +234,8 @@ def _patch_attention_layer() -> None:
             self,
             query: torch.Tensor,
             key: torch.Tensor,
-            query2: torch.Tensor,
-            key2: torch.Tensor,
+            query2: Optional[torch.Tensor],
+            key2: Optional[torch.Tensor],
             value: torch.Tensor,
             # For some alternate attention backends like MLA the attention output
             # shape does not match the query shape, so we optionally let the model
@@ -191,13 +269,15 @@ def _patch_attention_layer() -> None:
                     # NOTE(woosuk): We do this outside the custom op to minimize the
                     # CPU overheads from the non-CUDA-graph regions.
                     query = query.view(-1, self.num_heads, self.head_size)
-                    query2 = query2.view(-1, self.num_heads, self.head_size)
                     output = output.view(-1, self.num_heads, self.head_size)
                     if key is not None:
                         key = key.view(-1, self.num_kv_heads, self.head_size)
-                        key2 = key2.view(-1, self.num_kv_heads, self.head_size)
                     if value is not None:
                         value = value.view(-1, self.num_kv_heads, self.head_size)
+                    if query2 is not None and key2 is not None:
+                        query2 = query2.view(-1, self.num_heads, self.head_size)
+                        key2 = key2.view(-1, self.num_kv_heads, self.head_size)
+                    
                 if self.use_direct_call:
                     forward_context: ForwardContext = get_forward_context()
                     attn_metadata = forward_context.attn_metadata
@@ -251,8 +331,8 @@ def _patch_attention_layer() -> None:
         def unified_attention_impl(
             query: torch.Tensor,
             key: torch.Tensor,
-            query2: torch.Tensor,
-            key2: torch.Tensor,
+            query2: Optional[torch.Tensor],
+            key2: Optional[torch.Tensor],
             value: torch.Tensor,
             layer_name: str,
         ) -> torch.Tensor:
@@ -273,8 +353,8 @@ def _patch_attention_layer() -> None:
         def unified_attention_with_output_impl(
             query: torch.Tensor,
             key: torch.Tensor,
-            query2: torch.Tensor,
-            key2: torch.Tensor,
+            query2: Optional[torch.Tensor],
+            key2: Optional[torch.Tensor],
             value: torch.Tensor,
             output: torch.Tensor,
             layer_name: str,
@@ -315,7 +395,7 @@ def _patch_attention_layer() -> None:
 
     except ImportError:
         logger.warning(
-            "Could not patch unified attention with output - module not found"
+            "Could not patch layer - module not found"
         )
 
 
@@ -329,6 +409,7 @@ def _patch_triton_attn() -> None:
         from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadata
         from vllm import _custom_ops as ops
         from vllm.v1.attention.backends.triton_attn import TritonAttentionBackend, TritonAttentionImpl
+        from vllm.attention.ops.triton_unified_attention import unified_attention
         from ucm.sparse.rerope.triton_unified_attention_rerope import unified_attention_rerope
 
 
@@ -340,7 +421,10 @@ def _patch_triton_attn() -> None:
         ) -> tuple[int, ...]:
             if block_size % 16 != 0:
                 raise ValueError("Block size must be a multiple of 16.")
-            return (3, num_blocks, block_size, num_kv_heads, head_size)
+            
+            if rerope_config.use_rerope:
+                return (3, num_blocks, block_size, num_kv_heads, head_size)
+            return (2, num_blocks, block_size, num_kv_heads, head_size)
         
         TritonAttentionBackend.get_kv_cache_shape = staticmethod(TritonAttentionBackend_get_kv_cache_shape)
 
@@ -350,8 +434,8 @@ def _patch_triton_attn() -> None:
             layer: torch.nn.Module,
             query: torch.Tensor,
             key: torch.Tensor,
-            query2: torch.Tensor,
-            key2: torch.Tensor,
+            query2: Optional[torch.Tensor],
+            key2: Optional[torch.Tensor],
             value: torch.Tensor,
             kv_cache: torch.Tensor,
             attn_metadata: FlashAttentionMetadata,
@@ -393,22 +477,22 @@ def _patch_triton_attn() -> None:
 
             num_actual_tokens = attn_metadata.num_actual_tokens
 
-            key_cache, value_cache, key_cache2 = kv_cache.unbind(0)
-                
+            if rerope_config.use_rerope:
+                key_cache, value_cache, key_cache2 = kv_cache.unbind(0)
 
-            if self.kv_sharing_target_layer_name is None:
-                # Reshape the input keys and values and store them in the cache.
-                # Skip this if sharing KV cache with an earlier attention layer.
-                torch.ops._C_cache_ops.reshape_and_cache_flash(
-                    key,
-                    value,
-                    key_cache,
-                    value_cache,
-                    attn_metadata.slot_mapping,
-                    self.kv_cache_dtype,
-                    layer._k_scale,
-                    layer._v_scale,
-                )
+                if self.kv_sharing_target_layer_name is None:
+                    # Reshape the input keys and values and store them in the cache.
+                    # Skip this if sharing KV cache with an earlier attention layer.
+                    torch.ops._C_cache_ops.reshape_and_cache_flash(
+                        key,
+                        value,
+                        key_cache,
+                        value_cache,
+                        attn_metadata.slot_mapping,
+                        self.kv_cache_dtype,
+                        layer._k_scale,
+                        layer._v_scale,
+                    )
                 
                 torch.ops._C_cache_ops.reshape_and_cache_flash(
                     key2,
@@ -420,10 +504,27 @@ def _patch_triton_attn() -> None:
                     layer._k_scale,
                     layer._v_scale,
                 )
+            else:
+                key_cache, value_cache = kv_cache.unbind(0)
+
+                if self.kv_sharing_target_layer_name is None:
+                    # Reshape the input keys and values and store them in the cache.
+                    # Skip this if sharing KV cache with an earlier attention layer.
+                    torch.ops._C_cache_ops.reshape_and_cache_flash(
+                        key,
+                        value,
+                        key_cache,
+                        value_cache,
+                        attn_metadata.slot_mapping,
+                        self.kv_cache_dtype,
+                        layer._k_scale,
+                        layer._v_scale,
+                    )
 
             if self.kv_cache_dtype.startswith("fp8"):
                 key_cache = key_cache.view(self.fp8_dtype)
-                key_cache2 = key_cache2.view(self.fp8_dtype)
+                if key_cache2 is not None:
+                    key_cache2 = key_cache2.view(self.fp8_dtype)
                 value_cache = value_cache.view(self.fp8_dtype)
                 num_tokens, num_heads, head_size = query.shape
                 assert layer._q_scale == 1.0, \
@@ -456,29 +557,50 @@ def _patch_triton_attn() -> None:
                 block_table = attn_metadata.block_table
             
             descale_shape = (cu_seqlens_q.shape[0] - 1, key.shape[1])
-            
-            unified_attention_rerope(
-                q=query[:num_actual_tokens],
-                k=key_cache,
-                q2=query2[:num_actual_tokens],
-                k2=key_cache2,
-                v=value_cache,
-                out=output[:num_actual_tokens],
-                cu_seqlens_q=cu_seqlens_q,
-                max_seqlen_q=max_seqlen_q,
-                seqused_k=seqused_k,
-                max_seqlen_k=max_seqlen_k,
-                softmax_scale=self.scale,
-                causal=True,
-                rerope_window=REROPE_WINDOW,
-                alibi_slopes=self.alibi_slopes,
-                window_size=self.sliding_window,
-                block_table=block_table,
-                softcap=self.logits_soft_cap,
-                q_descale=None,
-                k_descale=layer._k_scale.expand(descale_shape),
-                v_descale=layer._v_scale.expand(descale_shape),
-            )
+
+            if rerope_config.use_rerope:
+                unified_attention_rerope(
+                    q=query[:num_actual_tokens],
+                    k=key_cache,
+                    q2=query2[:num_actual_tokens],
+                    k2=key_cache2,
+                    v=value_cache,
+                    out=output[:num_actual_tokens],
+                    cu_seqlens_q=cu_seqlens_q,
+                    max_seqlen_q=max_seqlen_q,
+                    seqused_k=seqused_k,
+                    max_seqlen_k=max_seqlen_k,
+                    softmax_scale=self.scale,
+                    causal=True,
+                    rerope_window=REROPE_WINDOW,
+                    alibi_slopes=self.alibi_slopes,
+                    window_size=self.sliding_window,
+                    block_table=block_table,
+                    softcap=self.logits_soft_cap,
+                    q_descale=None,
+                    k_descale=layer._k_scale.expand(descale_shape),
+                    v_descale=layer._v_scale.expand(descale_shape),
+                )
+            else:
+                unified_attention(
+                    q=query[:num_actual_tokens],
+                    k=key_cache,
+                    v=value_cache,
+                    out=output[:num_actual_tokens],
+                    cu_seqlens_q=cu_seqlens_q,
+                    max_seqlen_q=max_seqlen_q,
+                    seqused_k=seqused_k,
+                    max_seqlen_k=max_seqlen_k,
+                    softmax_scale=self.scale,
+                    causal=True,
+                    alibi_slopes=self.alibi_slopes,
+                    window_size=self.sliding_window,
+                    block_table=block_table,
+                    softcap=self.logits_soft_cap,
+                    q_descale=None,
+                    k_descale=layer._k_scale.expand(descale_shape),
+                    v_descale=layer._v_scale.expand(descale_shape),
+                )
 
             return output
 
@@ -486,4 +608,4 @@ def _patch_triton_attn() -> None:
 
 
     except ImportError:
-        logger.warning("Could not patch llama modelr - module not found")
+        logger.warning("Could not patch triton attention - module not found")
