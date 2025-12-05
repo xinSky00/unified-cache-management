@@ -61,7 +61,9 @@ def build_llm_with_uc(module_path: str, name: str, model: str):
     llm_args = EngineArgs(
         model=model,
         kv_transfer_config=ktc,
-        max_model_len=163840,
+        hf_overrides={
+            "max_position_embeddings": 65536,
+        },
         gpu_memory_utilization=0.8,
         max_num_batched_tokens=8192,
         block_size=128,
@@ -110,7 +112,7 @@ def main():
         materials = []
         questions = []
         references = []
-        batch_size = 5
+        batch_size = 15
         num_batch = 2
         for idx in range(num_batch):
             data = data_all[idx * batch_size: (idx+1) * batch_size]
