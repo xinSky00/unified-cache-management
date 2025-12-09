@@ -31,14 +31,18 @@ from typing import Optional
 
 from ucm.logger import init_logger
 
-
 logger = init_logger(__name__)
 
 import os
 
 PLATFORM = os.getenv("PLATFORM")
-use_rerope = os.getenv("VLLM_USE_REROPE", "false")
-use_rerope = bool(use_rerope)
+vllm_use_rerope = os.getenv("VLLM_USE_REROPE", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+
 
 def _patch_ascend() -> bool:
     return PLATFORM == "ascend"
@@ -95,15 +99,15 @@ def apply_all_patches() -> None:
             )
 
         # Apply version-specific patches
-        if version == "0.9.2" and use_rerope:
+        if version == "0.9.2" and vllm_use_rerope:
             _apply_patches_rerope()
         elif version == "0.9.2":
             _apply_patches_v092()
         else:
             logger.warning(
-                    f"Unsupported vLLM version: {version} to apply UCM patches. "
-                    f"Supported versions: {', '.join(supported_versions)}."
-                )
+                f"Unsupported vLLM version: {version} to apply UCM patches. "
+                f"Supported versions: {', '.join(supported_versions)}."
+            )
 
         _patches_applied = True
         logger.info(f"All vLLM patches applied successfully for version {version}")
