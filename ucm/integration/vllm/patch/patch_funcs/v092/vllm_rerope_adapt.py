@@ -29,15 +29,6 @@ from torch.library import Library
 from ucm.logger import init_logger
 
 logger = init_logger(__name__)
-import os
-
-vllm_use_rerope = os.getenv("VLLM_USE_REROPE", "0").lower() in (
-    "1",
-    "true",
-    "yes",
-    "on",
-)
-
 
 _UCM_UNIFIED_ATTENTION_WITH_OUTPUT_REGISTERED = False
 
@@ -65,15 +56,11 @@ def _patch_attention_spec() -> None:
         def _page_size_bytes_rerope(self: "AttentionSpec") -> int:
             """
             Patched version of page_size_bytes property.
-            Adds REROPE support with coefficient=3.
+            REROPE support with coefficient=3.
             """
-            # For MLA we only store a single latent vector
-            if self.use_mla:
-                coef = 1
-            elif vllm_use_rerope:
-                coef = 3
-            else:
-                coef = 2
+
+            coef = 3
+
             return (
                 coef
                 * self.block_size
@@ -114,6 +101,7 @@ def _patch_qwen_model() -> None:
         import math
 
         import torch
+        from vllm.forward_context import get_forward_context
         from vllm.model_executor.models.qwen2 import Qwen2Attention
 
         from ucm.sparse.rerope.rerope_utils import default_config
@@ -126,21 +114,27 @@ def _patch_qwen_model() -> None:
             positions: torch.Tensor,
             hidden_states: torch.Tensor,
         ) -> torch.Tensor:
+            attn_metadata = get_forward_context().attn_metadata
+
             qkv, _ = self.qkv_proj(hidden_states)
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-            q *= (
-                ((positions + 1)[:, None].log() / math.log(TRAINING_LENGTH))
-                .clip(1)
-                .to(q.dtype)
-            )
-            q2 = q.clone()
-            k2 = k.clone()
-            k0 = k.clone()
+            if attn_metadata and next(iter(attn_metadata.values())).use_rerope:
+                q *= (
+                    ((positions + 1)[:, None].log() / math.log(TRAINING_LENGTH))
+                    .clip(1)
+                    .to(q.dtype)
+                )
+                q2 = q.clone()
+                k2 = k.clone()
+                k0 = k.clone()
 
-            q, k = self.rotary_emb(positions, q, k)
-            q2, _ = self.rotary_emb(positions * 0 + REROPE_WINDOW, q2, k2)
-            del k2
+                q, k = self.rotary_emb(positions, q, k)
+                q2, _ = self.rotary_emb(positions * 0 + REROPE_WINDOW, q2, k2)
+                del k2
+            else:
+                q, k = self.rotary_emb(positions, q, k)
+                q2, k0 = None, None
 
             attn_output = self.attn(q, k, q2, k0, v)
             output, _ = self.o_proj(attn_output)
@@ -203,10 +197,12 @@ def _patch_attention_layer() -> None:
                     # NOTE(woosuk): We do this outside the custom op to minimize the
                     # CPU overheads from the non-CUDA-graph regions.
                     query = query.view(-1, self.num_heads, self.head_size)
-                    query2 = query2.view(-1, self.num_heads, self.head_size)
                     output = output.view(-1, self.num_heads, self.head_size)
+                    if query2 is not None:
+                        query2 = query2.view(-1, self.num_heads, self.head_size)
                     if key is not None:
                         key = key.view(-1, self.num_kv_heads, self.head_size)
+                    if key2 is not None:
                         key2 = key2.view(-1, self.num_kv_heads, self.head_size)
                     if value is not None:
                         value = value.view(-1, self.num_kv_heads, self.head_size)
@@ -397,7 +393,7 @@ def _patch_triton_attn() -> None:
             prefix_kv_lens: Optional[torch.Tensor]
             suffix_kv_lens: Optional[torch.Tensor]
 
-            max_prompt_len: int = 0
+            use_rerope: bool = False
 
             # Optional aot scheduling
             scheduler_metadata: Optional[torch.Tensor] = None
@@ -480,6 +476,8 @@ def _patch_triton_attn() -> None:
                     prompt_len = len(req_state.prompt_token_ids)
                     max_prompt_len = max(max_prompt_len, prompt_len)
 
+            use_rerope = max_prompt_len > REROPE_WINDOW
+
             use_cascade = common_prefix_len > 0
 
             if use_cascade:
@@ -512,7 +510,7 @@ def _patch_triton_attn() -> None:
                 suffix_kv_lens=suffix_kv_lens,
                 local_attn_metadata=local_attn_metadata,
                 prefix_scheduler_metadata=prefix_scheduler_metadata,
-                max_prompt_len=max_prompt_len,
+                use_rerope=use_rerope,
             )
             return attn_metadata
 
@@ -527,9 +525,7 @@ def _patch_triton_attn() -> None:
             if block_size % 16 != 0:
                 raise ValueError("Block size must be a multiple of 16.")
 
-            if vllm_use_rerope:
-                return (3, num_blocks, block_size, num_kv_heads, head_size)
-            return (2, num_blocks, block_size, num_kv_heads, head_size)
+            return (3, num_blocks, block_size, num_kv_heads, head_size)
 
         TritonAttentionBackend.get_kv_cache_shape = staticmethod(
             TritonAttentionBackend_get_kv_cache_shape
@@ -544,7 +540,7 @@ def _patch_triton_attn() -> None:
             key2: Optional[torch.Tensor],
             value: torch.Tensor,
             kv_cache: torch.Tensor,
-            attn_metadata: FlashAttentionMetadata,
+            attn_metadata: TritonAttentionMetadata,
             output: Optional[torch.Tensor] = None,
             output_scale: Optional[torch.Tensor] = None,
         ) -> torch.Tensor:
@@ -584,43 +580,26 @@ def _patch_triton_attn() -> None:
 
             num_actual_tokens = attn_metadata.num_actual_tokens
 
-            use_rerope = attn_metadata.max_prompt_len > REROPE_WINDOW
+            key_cache, value_cache, key_cache2 = kv_cache.unbind(0)
 
-            if vllm_use_rerope:
-                key_cache, value_cache, key_cache2 = kv_cache.unbind(0)
-
-                if self.kv_sharing_target_layer_name is None:
-                    # Reshape the input keys and values and store them in the cache.
-                    # Skip this if sharing KV cache with an earlier attention layer.
-                    torch.ops._C_cache_ops.reshape_and_cache_flash(
-                        key,
-                        value,
-                        key_cache,
-                        value_cache,
-                        attn_metadata.slot_mapping,
-                        self.kv_cache_dtype,
-                        layer._k_scale,
-                        layer._v_scale,
-                    )
-
+            if self.kv_sharing_target_layer_name is None:
+                # Reshape the input keys and values and store them in the cache.
+                # Skip this if sharing KV cache with an earlier attention layer.
+                torch.ops._C_cache_ops.reshape_and_cache_flash(
+                    key,
+                    value,
+                    key_cache,
+                    value_cache,
+                    attn_metadata.slot_mapping,
+                    self.kv_cache_dtype,
+                    layer._k_scale,
+                    layer._v_scale,
+                )
+                if key2 is not None:
                     torch.ops._C_cache_ops.reshape_and_cache_flash(
                         key2,
                         value,
                         key_cache2,
-                        value_cache,
-                        attn_metadata.slot_mapping,
-                        self.kv_cache_dtype,
-                        layer._k_scale,
-                        layer._v_scale,
-                    )
-            elif not vllm_use_rerope:
-                key_cache, value_cache = kv_cache.unbind(0)
-
-                if self.kv_sharing_target_layer_name is None:
-                    torch.ops._C_cache_ops.reshape_and_cache_flash(
-                        key,
-                        value,
-                        key_cache,
                         value_cache,
                         attn_metadata.slot_mapping,
                         self.kv_cache_dtype,
@@ -652,7 +631,7 @@ def _patch_triton_attn() -> None:
                             ).contiguous(),
                             layer._q_scale,
                         )
-                    query2 = query2.reshape((num_tokens, num_heads, head_size))
+                        query2 = query2.reshape((num_tokens, num_heads, head_size))
 
             use_local_attn = (
                 self.use_irope and attn_metadata.local_attn_metadata is not None
@@ -675,7 +654,7 @@ def _patch_triton_attn() -> None:
 
             descale_shape = (cu_seqlens_q.shape[0] - 1, key.shape[1])
 
-            if use_rerope:
+            if attn_metadata.use_rerope:
                 unified_attention_rerope(
                     q=query[:num_actual_tokens],
                     k=key_cache,
